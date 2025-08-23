@@ -3,6 +3,10 @@ import { getDatabase, runQuery } from '../sqlite';
 import * as bin from './index';
 import axios from 'axios';
 import { getFingerprint } from '../fingerprint';
+import { trace, context, SpanStatusCode } from '@opentelemetry/api';
+import { getTracer, getLogger } from '../../../otel';
+import { SeverityNumber } from '@opentelemetry/api-logs';
+import { recordHttpRequest } from '../metrics';
 
 // Help
 export const help = async (_args: string[]): Promise<string> => {
@@ -121,10 +125,33 @@ For example, try \`!What has Aditya written about running?\`
 
 // AI Assistant command: !<query>
 export const ai = async (args: string[]): Promise<string> => {
+  const tracer = getTracer();
+  const logger = getLogger();
   const question = args.join(' ').trim();
+
   if (!question) return 'Usage: !<your question>';
 
+  const span = tracer.startSpan('ai_assistant_query', {
+    attributes: {
+      'ai.question.length': question.length,
+      'ai.operation': 'knowledge_base_query',
+    },
+  });
+
   try {
+    // Set span in context
+    trace.setSpan(context.active(), span);
+
+    logger.emit({
+      severityNumber: SeverityNumber.INFO,
+      severityText: 'INFO',
+      body: 'AI assistant query started',
+      attributes: {
+        'ai.question.length': question.length,
+        operation: 'ai_query',
+      },
+    });
+
     // Get fingerprint data
     const { fingerprint, confidence } = await getFingerprint();
 
@@ -140,20 +167,81 @@ export const ai = async (args: string[]): Promise<string> => {
       confidence: confidence.toString(),
     };
 
+    span.setAttributes({
+      'ai.fingerprint.confidence': confidence,
+      'http.method': 'POST',
+      'http.url': 'https://knowledge-base.aditbala.com/ask',
+      'http.request.body.size': JSON.stringify(payload).length,
+    });
+
+    const httpStartTime = Date.now();
     const response = await axios.post(
       'https://knowledge-base.aditbala.com/ask',
       payload,
       { headers: { 'Content-Type': 'application/json' } },
     );
+    const httpDuration = Date.now() - httpStartTime;
+
+    span.setAttributes({
+      'http.response.status_code': response.status,
+      'http.response.body.size': JSON.stringify(response.data).length,
+      'ai.response.has_answer': !!response.data?.answer,
+    });
+
+    // Record HTTP request metrics
+    recordHttpRequest(
+      'POST',
+      'https://knowledge-base.aditbala.com/ask',
+      response.status,
+      httpDuration,
+    );
+
+    logger.emit({
+      severityNumber: SeverityNumber.INFO,
+      severityText: 'INFO',
+      body: 'AI assistant query completed successfully',
+      attributes: {
+        'http.response.status_code': response.status,
+        'ai.response.has_answer': !!response.data?.answer,
+      },
+    });
+
     // Try to extract a useful answer
     if (response.data?.answer) {
+      span.setStatus({ code: SpanStatusCode.OK });
       return response.data.answer;
     }
+    span.setStatus({ code: SpanStatusCode.OK });
     return JSON.stringify(response.data, null, 2);
   } catch (err: any) {
-    return `Error querying knowledge base: ${
-      err?.response?.data?.error || err.message
-    }`;
+    const errorMessage = err?.response?.data?.error || err.message;
+    const statusCode = err?.response?.status;
+
+    span.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: errorMessage,
+    });
+
+    span.setAttributes({
+      'error.type': err.name || 'UnknownError',
+      'error.message': errorMessage,
+      'http.response.status_code': statusCode || 0,
+    });
+
+    logger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: 'AI assistant query failed',
+      attributes: {
+        'error.type': err.name || 'UnknownError',
+        'error.message': errorMessage,
+        'http.response.status_code': statusCode || 0,
+      },
+    });
+
+    return `Error querying knowledge base: ${errorMessage}`;
+  } finally {
+    span.end();
   }
 };
 (
