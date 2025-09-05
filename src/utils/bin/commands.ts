@@ -3,6 +3,12 @@ import { getDatabase, runQuery } from '../sqlite';
 import * as bin from './index';
 import axios from 'axios';
 import { getFingerprint } from '../fingerprint';
+import { trace, context, SpanStatusCode } from '@opentelemetry/api';
+import { commandLogger } from '../logger';
+import { portfolioMetrics } from '../metrics';
+
+// Get tracer for command operations
+const tracer = trace.getTracer('portfolio-terminal-commands');
 
 // Help
 export const help = async (_args: string[]): Promise<string> => {
@@ -121,12 +127,43 @@ For example, try \`!What has Aditya written about running?\`
 
 // AI Assistant command: !<query>
 export const ai = async (args: string[]): Promise<string> => {
+  const span = tracer.startSpan('ai.query', {
+    attributes: {
+      'ai.question_args_count': args.length,
+    },
+  });
+
+  const timer = portfolioMetrics.createTimer();
   const question = args.join(' ').trim();
-  if (!question) return 'Usage: !<your question>';
+  let fingerprint = '';
+  let confidence = 0;
 
   try {
+    if (!question) {
+      span.setAttributes({ 'ai.error': 'empty_question' });
+      span.end();
+      return 'Usage: !<your question>';
+    }
+
+    span.setAttributes({
+      'ai.question': question,
+      'ai.question_length': question.length,
+    });
+
+    commandLogger.info('AI query started', {
+      'ai.question': question,
+      'ai.question_length': question.length,
+    });
+
     // Get fingerprint data
-    const { fingerprint, confidence } = await getFingerprint();
+    const fingerprintData = await getFingerprint();
+    fingerprint = fingerprintData.fingerprint;
+    confidence = fingerprintData.confidence;
+
+    span.setAttributes({
+      'user.fingerprint': fingerprint,
+      'user.confidence': confidence,
+    });
 
     interface ApiRequestPayload {
       question: string;
@@ -145,12 +182,61 @@ export const ai = async (args: string[]): Promise<string> => {
       payload,
       { headers: { 'Content-Type': 'application/json' } },
     );
+
+    span.setAttributes({
+      'http.status_code': response.status,
+      'ai.response_has_answer': !!response.data?.answer,
+    });
+
     // Try to extract a useful answer
     if (response.data?.answer) {
+      const duration = timer.end();
+      span.setAttributes({
+        'ai.answer_length': response.data.answer.length,
+        'ai.success': true,
+      });
+      commandLogger.info('AI query completed successfully', {
+        'ai.question': question,
+        'ai.answer_length': response.data.answer.length,
+        'user.fingerprint': fingerprint,
+      });
+      portfolioMetrics.recordAiQuery(duration, true, true);
+      span.end();
       return response.data.answer;
     }
-    return JSON.stringify(response.data, null, 2);
+
+    const jsonResponse = JSON.stringify(response.data, null, 2);
+    const duration = timer.end();
+    span.setAttributes({
+      'ai.response_length': jsonResponse.length,
+      'ai.success': true,
+    });
+    commandLogger.info('AI query completed with JSON response', {
+      'ai.question': question,
+      'ai.response_length': jsonResponse.length,
+      'user.fingerprint': fingerprint,
+    });
+    portfolioMetrics.recordAiQuery(duration, true, false);
+    span.end();
+    return jsonResponse;
   } catch (err: any) {
+    const duration = timer.end();
+    span.recordException(err);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+    span.setAttributes({
+      'ai.success': false,
+      'error.message': err.message,
+      'error.status_code': err?.response?.status,
+    });
+    commandLogger.error('AI query failed', err, {
+      'ai.question': question,
+      'user.fingerprint': fingerprint,
+      'error.status_code': err?.response?.status,
+    });
+    portfolioMetrics.recordAiQuery(duration, false, false);
+    portfolioMetrics.recordError('ai_query', err.name);
+    span.end();
+
     return `Error querying knowledge base: ${
       err?.response?.data?.error || err.message
     }`;
