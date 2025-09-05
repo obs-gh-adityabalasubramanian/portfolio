@@ -2,6 +2,13 @@ import React from 'react';
 import '../styles/global.css';
 import Head from 'next/head';
 
+// Initialize OpenTelemetry on the client side
+if (typeof window !== 'undefined') {
+  import('../otel-client').then(({ initOtel }) => {
+    initOtel();
+  });
+}
+
 const App = ({ Component, pageProps }) => {
   const inputRef = React.useRef<HTMLInputElement>(null);
 
